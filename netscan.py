@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python3
-"""Home Wi-Fi device scanner for your local network."""
+"""Home Wi-Fi NetScan: live discovery on your local network."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ APP_TITLE = "Home Wi-Fi NetScan"
 
 
 def get_local_network():
-    """Return the active interface, local IPv4 address and subnet."""
+    """Return (interface, local_ip, subnet)."""
     if netifaces is None:
         raise RuntimeError(
             "Missing dependency. Run:\n"
@@ -34,7 +34,6 @@ def get_local_network():
     gateways = netifaces.gateways()
     default = gateways.get("default", {}).get(netifaces.AF_INET)
     preferred_iface = default[1] if default else None
-
     candidates = []
 
     for iface in netifaces.interfaces():
@@ -44,14 +43,9 @@ def get_local_network():
         for addr in netifaces.ifaddresses(iface).get(
             netifaces.AF_INET, []
         ):
-            ip = addr.get("addr")
-            mask = addr.get("netmask")
+            ip, mask = addr.get("addr"), addr.get("netmask")
 
-            if (
-                not ip
-                or not mask
-                or ip.startswith(("127.", "169.254."))
-            ):
+            if not ip or not mask or ip.startswith(("127.", "169.254.")):
                 continue
 
             try:
@@ -62,40 +56,17 @@ def get_local_network():
             except ValueError:
                 continue
 
-    if not candidates and preferred_iface:
-        for iface in netifaces.interfaces():
-            for addr in netifaces.ifaddresses(iface).get(
-                netifaces.AF_INET, []
-            ):
-                ip = addr.get("addr")
-                mask = addr.get("netmask")
-
-                if (
-                    not ip
-                    or not mask
-                    or ip.startswith(("127.", "169.254."))
-                ):
-                    continue
-
-                try:
-                    network = ipaddress.ip_network(
-                        f"{ip}/{mask}", strict=False
-                    )
-                    candidates.append((iface, ip, network))
-                except ValueError:
-                    continue
-
     if not candidates:
         raise RuntimeError(
             "Could not detect an active IPv4 network. "
-            "Connect to your home Wi-Fi and try again."
+            "Connect to your Wi-Fi and try again."
         )
 
     return candidates[0]
 
 
 def discover_bonjour_names():
-    """Discover device/service names advertised using Bonjour or mDNS."""
+    """Find names that local devices advertise through Bonjour/mDNS."""
     names = {}
 
     try:
@@ -140,27 +111,23 @@ def discover_bonjour_names():
             "_ssh._tcp.local.",
         ]
 
-        zeroconf = Zeroconf()
+        zc = Zeroconf()
         browsers = []
 
         try:
             listener = Listener()
-
             for service_type in service_types:
                 try:
                     browsers.append(
-                        ServiceBrowser(
-                            zeroconf, service_type, listener
-                        )
+                        ServiceBrowser(zc, service_type, listener)
                     )
                 except Exception:
-                    continue
+                    pass
 
-            # Allow a short time for local services to respond.
             time.sleep(3)
 
         finally:
-            zeroconf.close()
+            zc.close()
 
     except ImportError:
         pass
@@ -171,58 +138,50 @@ def discover_bonjour_names():
 
 
 def scan_with_nmap(network):
-    """Discover responding devices and their available identifying details."""
-    if not shutil.which("nmap"):
+    """Scan for live hosts and parse Nmap XML results."""
+    nmap_path = shutil.which("nmap")
+    if not nmap_path:
         raise RuntimeError(
-            "Nmap is not installed.\n\n"
-            "macOS: brew install nmap\n"
-            "Windows: install Nmap from nmap.org\n"
-            "Linux: install Nmap using your package manager."
+            "Nmap is not installed. On macOS, run: brew install nmap"
         )
 
-    # Host discovery only: this does not scan device ports.
-    # XML output makes host, IP and MAC parsing more reliable.
+    # Use sudo only when it has already been authorised with sudo -v.
+    # If not authorised, retry normally rather than prompting inside the GUI.
     command = [
-        "nmap",
-        "-sn",
-        "-PR",
-        "-R",
-        "-oX",
-        "-",
-        str(network),
+        "sudo", "-n", nmap_path,
+        "-sn", "-PR", "-R", "-oX", "-", str(network),
     ]
 
     try:
         result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=180,
+            command, capture_output=True, text=True, timeout=180
         )
+
+        if result.returncode != 0:
+            # Fall back to a normal scan if sudo isn't authorised.
+            command = [
+                nmap_path, "-sn", "-PR", "-R", "-oX", "-", str(network)
+            ]
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=180
+            )
+
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            "The scan timed out. Check your Wi-Fi and try again."
-        )
+        raise RuntimeError("Scan timed out. Please try again.")
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(
-            f"Nmap scan failed:\n"
-            f"{detail or 'No error details were returned.'}"
-        )
+        raise RuntimeError(f"Nmap scan failed:\n{detail}")
 
     try:
         root = ET.fromstring(result.stdout)
     except ET.ParseError:
-        raise RuntimeError(
-            "Could not read Nmap's scan results."
-        )
+        raise RuntimeError("Could not parse Nmap's XML results.")
 
     devices = []
 
     for host in root.findall("host"):
         status = host.find("status")
-
         if status is None or status.get("state") != "up":
             continue
 
@@ -233,52 +192,40 @@ def scan_with_nmap(network):
             "vendor": "",
         }
 
-        # Read IP addresses and MAC/vendor details from Nmap XML.
         for address in host.findall("address"):
-            address_type = address.get("addrtype")
+            kind = address.get("addrtype")
             value = address.get("addr", "")
 
-            if address_type == "ipv4":
+            if kind == "ipv4":
                 device["ip"] = value
-
-            elif address_type == "mac":
+            elif kind == "mac":
                 device["mac"] = value.upper()
                 device["vendor"] = address.get("vendor", "")
 
-        # Use the hostname Nmap discovers through DNS.
         hostnames = host.find("hostnames")
-
         if hostnames is not None:
             for entry in hostnames.findall("hostname"):
                 name = entry.get("name", "").strip()
-
                 if name:
                     device["hostname"] = name
                     break
 
-        # Try a reverse-DNS lookup if Nmap didn't supply a name.
         if device["ip"] and device["hostname"] == "Unknown":
             try:
-                hostname = socket.gethostbyaddr(
-                    device["ip"]
-                )[0]
-
-                if hostname:
-                    device["hostname"] = hostname
-
+                name = socket.gethostbyaddr(device["ip"])[0]
+                if name:
+                    device["hostname"] = name
             except (socket.herror, socket.gaierror, OSError):
                 pass
 
         if device["ip"]:
             devices.append(device)
 
-    # Discover additional names advertised on the local network.
-    bonjour_names = discover_bonjour_names()
-
+    # Try Bonjour discovery for hosts without a reverse-DNS name.
+    advertised_names = discover_bonjour_names()
     for device in devices:
         if device["hostname"] == "Unknown":
-            name = bonjour_names.get(device["ip"])
-
+            name = advertised_names.get(device["ip"])
             if name:
                 device["hostname"] = name
 
@@ -293,7 +240,6 @@ class NetScanApp:
         self.root.minsize(760, 420)
 
         style = ttk.Style()
-
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -303,17 +249,16 @@ class NetScanApp:
         outer.pack(fill="both", expand=True)
 
         ttk.Label(
-            outer,
-            text="Home Wi-Fi NetScan",
-            font=("Arial", 22, "bold"),
+            outer, text="Home Wi-Fi NetScan",
+            font=("Arial", 22, "bold")
         ).pack(anchor="w")
 
         ttk.Label(
             outer,
             text=(
-                "Discover devices on your local network. "
-                "Names and manufacturers depend on the information "
-                "each device and your network make available."
+                "Live discovery of devices on your local network. "
+                "Device names and manufacturers depend on what the "
+                "network makes available."
             ),
             wraplength=920,
         ).pack(anchor="w", pady=(5, 14))
@@ -321,43 +266,30 @@ class NetScanApp:
         info = ttk.Frame(outer)
         info.pack(fill="x", pady=(0, 12))
 
-        self.network_var = tk.StringVar(
-            value="Network: detecting..."
-        )
-
+        self.network_var = tk.StringVar(value="Network: detecting...")
         ttk.Label(
-            info,
-            textvariable=self.network_var,
+            info, textvariable=self.network_var
         ).pack(side="left", fill="x", expand=True)
 
         self.scan_button = ttk.Button(
-            info,
-            text="Scan home Wi-Fi",
-            command=self.start_scan,
+            info, text="Scan home Wi-Fi", command=self.start_scan
         )
         self.scan_button.pack(side="right")
 
         columns = ("ip", "hostname", "mac", "vendor")
-
         self.table = ttk.Treeview(
-            outer,
-            columns=columns,
-            show="headings",
-            height=16,
+            outer, columns=columns, show="headings", height=16
         )
 
-        for column, label, width in [
+        for col, label, width in [
             ("ip", "IP address", 140),
             ("hostname", "Device / hostname", 250),
             ("mac", "MAC address", 190),
             ("vendor", "Manufacturer (if known)", 300),
         ]:
-            self.table.heading(column, text=label)
+            self.table.heading(col, text=label)
             self.table.column(
-                column,
-                width=width,
-                minwidth=90,
-                anchor="w",
+                col, width=width, minwidth=90, anchor="w"
             )
 
         self.table.pack(fill="both", expand=True)
@@ -365,36 +297,27 @@ class NetScanApp:
         bottom = ttk.Frame(outer)
         bottom.pack(fill="x", pady=(10, 0))
 
-        self.status_var = tk.StringVar(
-            value="Ready. Connect to your home Wi-Fi, then scan."
-        )
-
+        self.status_var = tk.StringVar(value="Ready to scan.")
         ttk.Label(
-            bottom,
-            textvariable=self.status_var,
+            bottom, textvariable=self.status_var
         ).pack(side="left", fill="x", expand=True)
 
         ttk.Button(
-            bottom,
-            text="Export CSV",
-            command=self.export_csv,
+            bottom, text="Export CSV", command=self.export_csv
         ).pack(side="right")
 
         self.devices = []
         self.network = None
-
         self.refresh_network_label()
 
     def refresh_network_label(self):
         try:
             iface, ip, network = get_local_network()
             self.network = network
-
             self.network_var.set(
                 f"Interface: {iface}  •  Your IP: {ip}  "
                 f"•  Subnet: {network}"
             )
-
         except Exception as exc:
             self.network = None
             self.network_var.set("Network details unavailable")
@@ -406,36 +329,26 @@ class NetScanApp:
 
         if self.network is None:
             messagebox.showerror(
-                "Network unavailable",
-                self.status_var.get(),
+                "Network unavailable", self.status_var.get()
             )
             return
 
         self.scan_button.configure(state="disabled")
-        self.status_var.set(
-            f"Scanning {self.network} for responding devices..."
-        )
-
+        self.status_var.set(f"Scanning {self.network}...")
         threading.Thread(
-            target=self._scan_worker,
-            daemon=True,
+            target=self._scan_worker, daemon=True
         ).start()
 
     def _scan_worker(self):
         try:
             devices = scan_with_nmap(self.network)
-
             self.root.after(
-                0,
-                lambda results=devices: self.show_results(results),
+                0, lambda results=devices: self.show_results(results)
             )
-
         except Exception as exc:
             error = str(exc)
-
             self.root.after(
-                0,
-                lambda err=error: self.scan_failed(err),
+                0, lambda err=error: self.scan_failed(err)
             )
 
     def show_results(self, devices):
@@ -446,11 +359,10 @@ class NetScanApp:
 
         for device in sorted(
             devices,
-            key=lambda item: ipaddress.ip_address(item["ip"]),
+            key=lambda d: ipaddress.ip_address(d["ip"])
         ):
             self.table.insert(
-                "",
-                "end",
+                "", "end",
                 values=(
                     device["ip"],
                     device["hostname"],
@@ -460,10 +372,8 @@ class NetScanApp:
             )
 
         self.scan_button.configure(state="normal")
-
         self.status_var.set(
-            f"Scan complete: {len(devices)} responding device(s) found. "
-            "Some devices may not disclose identifying information."
+            f"Scan complete: {len(devices)} responding device(s) found."
         )
 
     def scan_failed(self, error):
@@ -474,8 +384,7 @@ class NetScanApp:
     def export_csv(self):
         if not self.devices:
             messagebox.showinfo(
-                "Nothing to export",
-                "Run a scan first.",
+                "Nothing to export", "Run a scan first."
             )
             return
 
@@ -491,21 +400,12 @@ class NetScanApp:
 
         try:
             with open(
-                path,
-                "w",
-                newline="",
-                encoding="utf-8",
+                path, "w", newline="", encoding="utf-8"
             ) as handle:
                 writer = csv.DictWriter(
                     handle,
-                    fieldnames=[
-                        "ip",
-                        "hostname",
-                        "mac",
-                        "vendor",
-                    ],
+                    fieldnames=["ip", "hostname", "mac", "vendor"],
                 )
-
                 writer.writeheader()
                 writer.writerows(self.devices)
 
@@ -514,10 +414,7 @@ class NetScanApp:
             )
 
         except OSError as exc:
-            messagebox.showerror(
-                "Export failed",
-                str(exc),
-            )
+            messagebox.showerror("Export failed", str(exc))
 
 
 def main():
