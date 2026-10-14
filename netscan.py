@@ -2,6 +2,8 @@
 """Home Wi-Fi NetScan: discover devices on the currently selected local subnet."""
 from __future__ import annotations
 
+import select
+import time
 import csv
 import ipaddress
 import os
@@ -213,37 +215,166 @@ def reverse_dns(ip):
     return ""
 
 
+def dns_sd_output(args, timeout=1.5):
+    """Collect output from macOS Bonjour without losing buffered lines."""
+    executable = shutil.which("dns-sd")
+    if not executable:
+        return ""
+
+    try:
+        process = subprocess.Popen(
+            [executable, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError:
+        return ""
+
+    try:
+        time.sleep(timeout)
+        process.terminate()
+        output, _ = process.communicate(timeout=2)
+        return output or ""
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+        return output or ""
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+def bonjour_device_names(network):
+    """Discover friendly device names advertised through Bonjour."""
+    if not shutil.which("dns-sd"):
+        return {}
+
+    service_types = [
+        "_airplay._tcp.",
+        "_raop._tcp.",
+        "_googlecast._tcp.",
+        "_androidtvremote2._tcp.",
+        "_homeconnect._tcp.",
+        "_companion-link._tcp.",
+    ]
+
+    services = {}
+
+    for service_type in service_types:
+        output = dns_sd_output(
+            ["-B", service_type, "local."],
+            timeout=3,
+        )
+
+        for line in output.splitlines():
+            # dns-sd output can contain non-breaking spaces.
+            fields = line.replace("\u00a0", " ").split()
+
+            # Browse rows contain: timestamp, Add/Remove, flags,
+            # interface, domain, service type, instance name.
+            if len(fields) < 7 or fields[1] != "Add":
+                continue
+
+            if fields[4].rstrip(".") != "local":
+                continue
+
+            if fields[5].rstrip(".") != service_type.rstrip("."):
+                continue
+
+            instance = " ".join(fields[6:]).strip()
+            if instance:
+                services[(service_type, instance)] = instance
+
+    names_by_ip = {}
+
+    for (service_type, instance), friendly_name in list(services.items())[:30]:
+        lookup = dns_sd_output(
+            ["-L", instance, service_type, "local."],
+            timeout=2,
+        )
+
+        host_match = re.search(
+            r"can be reached at\s+([^\s:]+)",
+            lookup,
+            re.IGNORECASE,
+        )
+        if not host_match:
+            continue
+
+        hostname = host_match.group(1).rstrip(".")
+        addresses = dns_sd_output(
+            ["-G", "v4", hostname],
+            timeout=2,
+        )
+
+        for ip in re.findall(
+            r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])",
+            addresses,
+        ):
+            try:
+                address = ipaddress.ip_address(ip)
+                if address.is_loopback or address not in network:
+                    continue
+            except ValueError:
+                continue
+
+            names_by_ip.setdefault(ip, friendly_name)
+
+    return names_by_ip
 def scan_devices(network):
     if not shutil.which("nmap"):
-        raise RuntimeError("Nmap is not installed. On macOS, run: brew install nmap")
+        raise RuntimeError(
+            "Nmap is not installed. On macOS, run: brew install nmap"
+        )
 
-    devices, scan_mode = nmap_xml_scan(network, get_local_network()[0])
-    # Enrich Nmap results with MACs learned by the operating system's ARP cache.
+    devices, scan_mode = nmap_xml_scan(
+        network,
+        get_local_network()[0],
+    )
+
     arp = arp_table()
-    by_ip = {d["ip"]: d for d in devices}
+    by_ip = {device["ip"]: device for device in devices}
+
     for ip, mac in arp.items():
         try:
             if ipaddress.ip_address(ip) not in network:
                 continue
         except ValueError:
             continue
+
         if ip not in by_ip:
-            by_ip[ip] = {"ip": ip, "hostname": "", "mac": mac, "vendor": ""}
+            by_ip[ip] = {
+                "ip": ip,
+                "hostname": "",
+                "mac": mac,
+                "vendor": "",
+            }
         elif not by_ip[ip]["mac"]:
             by_ip[ip]["mac"] = mac
 
-    # Resolve names and vendors after discovery; never invent a device name.
-    for device in by_ip.values():
-        if not device["hostname"]:
-            device["hostname"] = reverse_dns(device["ip"]) or "Name unavailable"
-        if not device["vendor"] and device["mac"]:
-            device["vendor"] = vendor_from_nmap_database(device["mac"])
-        if not device["vendor"]:
-            device["vendor"] = "Manufacturer unavailable"
-        if not device["mac"]:
-            device["mac"] = ""
-    return list(by_ip.values()), scan_mode
+    try:
+        bonjour_names = bonjour_device_names(network)
+    except (OSError, RuntimeError):
+        bonjour_names = {}
 
+    for ip, device in by_ip.items():
+        if not device.get("hostname", "").strip():
+            device["hostname"] = (
+                bonjour_names.get(ip)
+                or reverse_dns(ip)
+                or "Name unavailable"
+            )
+
+        if not device.get("vendor") and device.get("mac"):
+            device["vendor"] = vendor_from_nmap_database(device["mac"])
+
+        if not device.get("vendor"):
+            device["vendor"] = "Manufacturer unavailable"
+
+        if not device.get("mac"):
+            device["mac"] = ""
+
+    return list(by_ip.values()), scan_mode
 
 class NetScanApp:
     def __init__(self, root):
