@@ -11,6 +11,61 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import subprocess
+import xml.etree.ElementTree as ET
+
+
+def scan_devices(subnet):
+    """Discover devices and their available identification details."""
+    result = subprocess.run(
+        ["nmap", "-sn", "-R", "-oX", "-", subnet],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True
+    )
+
+    root = ET.fromstring(result.stdout)
+    devices = []
+
+    for host in root.findall("host"):
+        status = host.find("status")
+
+        if status is None or status.get("state") != "up":
+            continue
+
+        ip = None
+        mac = None
+        manufacturer = "Unknown"
+        hostname = "Unknown"
+
+        for address in host.findall("address"):
+            if address.get("addrtype") == "ipv4":
+                ip = address.get("addr")
+            elif address.get("addrtype") == "mac":
+                mac = address.get("addr")
+                manufacturer = (
+                    address.get("vendor") or "Unknown"
+                )
+
+        names = host.find("hostnames")
+        if names is not None:
+            for entry in names.findall("hostname"):
+                name = entry.get("name")
+                if name:
+                    hostname = name
+                    break
+
+        if ip:
+            devices.append({
+                "ip": ip,
+                "hostname": hostname,
+                "mac": mac or "Not reported",
+                "manufacturer": manufacturer
+            })
+
+    return devices
+
 try:
     import netifaces
 except ImportError:
