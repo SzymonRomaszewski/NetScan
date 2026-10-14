@@ -108,7 +108,7 @@ def nmap_xml_scan(network, interface):
 
     # Explicitly select the interface detected for this subnet. On macOS, MAC/vendor
     # details usually require Nmap to run with administrator privileges.
-    base = [nmap, "-sn", "-PR", "-R", "--reason", "-e", interface, "-oX", "-", str(network)]
+    base = [nmap, "-sn", "-PR", "-oX", "-", str(network)]
     errors = []
 
     # First try an already-authorised sudo session (e.g. after running `sudo -v`).
