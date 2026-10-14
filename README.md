@@ -37,18 +37,36 @@ NetScan is designed to be straightforward: open the app, scan your local network
 
 - Python 3.10 or newer
 - Nmap installed and available on your system's `PATH`
-- Python dependency: `netifaces`
+- `netifaces` — detects the active network interface and IPv4 subnet
+- `zeroconf` — discovers names advertised through compatible local network services
+- Tkinter — provides the desktop graphical interface
 
-## Installation
+Install the Python dependencies with:
 
-### macOS
+```bash
+python3 -m pip install -r requirements.txt
+```
 
-1. Install [Homebrew](https://brew.sh/) if it is not already installed.
-2. Open Terminal and install Nmap:
+On macOS, install Nmap using Homebrew:
+### Run NetScan
 
-   ```bash
-   brew install nmap
-   ```
+From the project directory, run:
+
+```bash
+sudo -v
+python3 netscan.py
+```
+
+The first command authorises subsequent privileged commands for a limited period. Launch NetScan normally; do not run the entire graphical application as root.
+
+NetScan attempts a privileged Nmap scan and falls back to an unprivileged scan if that is unavailable. Without sufficient permissions, MAC-address and manufacturer information may be incomplete.
+
+```bash
+brew install nmap
+```
+
+**Note:** Device names and manufacturer details depend on information available on the network. Some devices will appear as `Unknown` or `Not reported`.
+
 
 3. Download or clone this repository, then enter the project folder:
 
