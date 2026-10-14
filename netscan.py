@@ -11,6 +11,8 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+devices = scan_devices("192.168.0.0/24")
+
 import subprocess
 import xml.etree.ElementTree as ET
 
